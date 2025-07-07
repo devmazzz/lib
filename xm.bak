@@ -1,0 +1,245 @@
+import argparse
+import os
+import base64
+from github import Github
+from github.GithubException import GithubException
+import glob
+from pathlib import Path
+
+# Caminho para armazenar o token
+TOKEN_PATH = os.path.expanduser("~/.mygit_token")
+
+def get_github_client():
+    """Obtém o cliente GitHub autenticado."""
+    if not os.path.exists(TOKEN_PATH):
+        print("Erro: Faça login primeiro com 'mygit login'.")
+        exit(1)
+    with open(TOKEN_PATH, 'r') as f:
+        token = f.read().strip()
+    return Github(token)
+
+def login(args):
+    """Faz login salvando o token do GitHub."""
+    token = input("Digite seu token do GitHub: ").strip()
+    try:
+        g = Github(token)
+        user = g.get_user()
+        print(f"Login bem-sucedido como {user.login}")
+        with open(TOKEN_PATH, 'w') as f:
+            f.write(token)
+    except GithubException as e:
+        print(f"Erro ao fazer login: {e}")
+        exit(1)
+
+def parse_repo_path(repo_path):
+    """Interpreta o caminho do repositório no formato usuario/repositório:caminho."""
+    parts = repo_path.split(':', 1)
+    repo_name = parts[0]
+    repo_path = parts[1] if len(parts) > 1 else ""
+    return repo_name, repo_path
+
+def send_file(args):
+    """Envia um arquivo local para o repositório."""
+    g = get_github_client()
+    file_path, repo_path = args.file, args.repo
+    repo_name, repo_file_path = parse_repo_path(repo_path)
+    
+    try:
+        repo = g.get_repo(repo_name)
+    except GithubException as e:
+        print(f"Erro: Repositório '{repo_name}' não encontrado ou inacessível: {e}")
+        exit(1)
+        
+    if not os.path.isfile(file_path):
+        print(f"Erro: '{file_path}' não é um arquivo válido.")
+        exit(1)
+        
+    try:
+        with open(file_path, 'rb') as f:
+            content = f.read()
+        file_name = repo_file_path or os.path.basename(file_path)
+        try:
+            contents = repo.get_contents(file_name)
+            repo.update_file(file_name, f"Update {file_name}", content, contents.sha)
+            print(f"Arquivo {file_name} atualizado no repositório {repo_name}")
+        except GithubException as e:
+            if e.status == 404:
+                repo.create_file(file_name, f"Add {file_name}", content)
+                print(f"Arquivo {file_name} enviado para o repositório {repo_name}")
+            else:
+                print(f"Erro ao enviar arquivo: {e}")
+                exit(1)
+    except GithubException as e:
+        print(f"Erro ao enviar arquivo: {e}")
+        exit(1)
+
+def copy(args):
+    """Copia arquivos de/para o repositório."""
+    g = get_github_client()
+    src, dst = args.src, args.dst
+    
+    if src.startswith('.') or not ':' in src:
+        # Upload: local -> remoto
+        repo_name, repo_path = parse_repo_path(dst)
+        try:
+            repo = g.get_repo(repo_name)
+        except GithubException as e:
+            print(f"Erro: Repositório '{repo_name}' não encontrado ou inacessível: {e}")
+            exit(1)
+            
+        src_path = Path(src)
+        if src_path.is_dir():
+            for file_path in src_path.rglob('*'):
+                if file_path.is_file():
+                    rel_path = file_path.relative_to(src_path)
+                    dest_path = os.path.join(repo_path, str(rel_path)).replace('\\', '/')
+                    with open(file_path, 'rb') as f:
+                        content = f.read()
+                    try:
+                        contents = repo.get_contents(dest_path)
+                        repo.update_file(dest_path, f"Update {dest_path}", content, contents.sha)
+                        print(f"Arquivo {dest_path} atualizado em {repo_name}")
+                    except GithubException as e:
+                        if e.status == 404:
+                            repo.create_file(dest_path, f"Add {dest_path}", content)
+                            print(f"Arquivo {dest_path} enviado para {repo_name}")
+                        else:
+                            print(f"Erro ao enviar arquivo {dest_path}: {e}")
+                            exit(1)
+        elif src_path.is_file():
+            dest_path = repo_path or os.path.basename(src)
+            with open(src, 'rb') as f:
+                content = f.read()
+            try:
+                contents = repo.get_contents(dest_path)
+                repo.update_file(dest_path, f"Update {dest_path}", content, contents.sha)
+                print(f"Arquivo {dest_path} atualizado em {repo_name}")
+            except GithubException as e:
+                if e.status == 404:
+                    repo.create_file(dest_path, f"Add {dest_path}", content)
+                    print(f"Arquivo {dest_path} enviado para {repo_name}")
+                else:
+                    print(f"Erro ao enviar arquivo {dest_path}: {e}")
+                    exit(1)
+        else:
+            print(f"Erro: {src} não é um arquivo ou diretório válido.")
+            exit(1)
+    else:
+        # Download: remoto -> local
+        repo_name, repo_path = parse_repo_path(src)
+        try:
+            repo = g.get_repo(repo_name)
+        except GithubException as e:
+            print(f"Erro: Repositório '{repo_name}' não encontrado ou inacessível: {e}")
+            exit(1)
+        try:
+            contents = repo.get_contents(repo_path)
+            if isinstance(contents, list):
+                os.makedirs(dst, exist_ok=True)
+                for content in contents:
+                    if content.type == 'file':
+                        file_content = base64.b64decode(content.content)
+                        local_path = os.path.join(dst, content.name)
+                        with open(local_path, 'wb') as f:
+                            f.write(file_content)
+                        print(f"Arquivo {content.name} baixado para {local_path}")
+            else:
+                file_content = base64.b64decode(contents.content)
+                local_path = os.path.join(dst, contents.name)
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                with open(local_path, 'wb') as f:
+                    f.write(file_content)
+                print(f"Arquivo {contents.name} baixado para {local_path}")
+        except GithubException as e:
+            print(f"Erro ao baixar: {e}")
+            exit(1)
+
+def remove_file(args):
+    """Remove um arquivo do repositório."""
+    g = get_github_client()
+    repo_name, repo_path = parse_repo_path(args.file)
+    
+    try:
+        repo = g.get_repo(repo_name)
+        contents = repo.get_contents(repo_path)
+        repo.delete_file(repo_path, f"Remove {repo_path}", contents.sha)
+        print(f"Arquivo {repo_path} removido de {repo_name}")
+    except GithubException as e:
+        print(f"Erro ao remover arquivo: {e}")
+        exit(1)
+
+def list_files(args):
+    """Lista arquivos no repositório ou repositórios do usuário."""
+    g = get_github_client()
+    
+    if args.repo == ':.':
+        # Lista todos os repositórios do usuário autenticado
+        try:
+            user = g.get_user()
+            repos = user.get_repos()
+            if not repos.totalCount:
+                print("Nenhum repositório encontrado para o usuário.")
+                return
+            print("Repositórios do usuário:")
+            for repo in repos:
+                print(f"repo: {repo.full_name}")
+        except GithubException as e:
+            print(f"Erro ao listar repositórios: {e}")
+            exit(1)
+    else:
+        # Lista arquivos no repositório especificado
+        repo_name, repo_path = parse_repo_path(args.repo)
+        try:
+            repo = g.get_repo(repo_name)
+            contents = repo.get_contents(repo_path)
+            if isinstance(contents, list):
+                for content in contents:
+                    print(f"{'dir' if content.type == 'dir' else 'file'}: {content.path}")
+            else:
+                print(f"file: {contents.path}")
+        except GithubException as e:
+            print(f"Erro ao listar arquivos: {e}")
+            exit(1)
+
+def main():
+    parser = argparse.ArgumentParser(description="CLI para gerenciar repositórios GitHub.")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # Login
+    subparsers.add_parser("login", help="Faz login no GitHub")
+
+    # Send
+    parser_send = subparsers.add_parser("send", help="Envia um arquivo para o repositório")
+    parser_send.add_argument("file", help="Caminho do arquivo local")
+    parser_send.add_argument("repo", help="Repositório no formato usuario/repositório[:caminho]")
+
+    # Copy
+    parser_copy = subparsers.add_parser("copy", help="Copia arquivos de/para o repositório")
+    parser_copy.add_argument("src", help="Origem (local ou usuario/repositório:caminho)")
+    parser_copy.add_argument("dst", help="Destino (local ou usuario/repositório:caminho)")
+
+    # Remove
+    parser_rm = subparsers.add_parser("rm", help="Remove um arquivo do repositório")
+    parser_rm.add_argument("file", help="Arquivo no formato usuario/repositório:caminho")
+
+    # List
+    parser_ls = subparsers.add_parser("ls", help="Lista arquivos no repositório")
+    parser_ls.add_argument("repo", help="Repositório no formato usuario/repositório[:caminho]", nargs="?", default=":.")
+
+    args = parser.parse_args()
+
+    if args.command == "login":
+        login(args)
+    elif args.command == "send":
+        send_file(args)
+    elif args.command == "copy":
+        copy(args)
+    elif args.command == "rm":
+        remove_file(args)
+    elif args.command == "ls":
+        list_files(args)
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
